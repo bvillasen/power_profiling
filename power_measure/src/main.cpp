@@ -70,6 +70,8 @@ int main(int argc, char* argv[]) {
   // if ( argc >= 4 ) std::vector devices<int> = parse_devices_argument( argv[3] );
   std::vector<int> devices = { 0 };
   // std::vector<int> devices = { 0, 1, 2, 3 };
+
+  bool get_cray_counters = false;
   
   int n_gpus = devices.size();
   int n_samples = static_cast<int>( time * sampling_freq );
@@ -93,13 +95,17 @@ int main(int argc, char* argv[]) {
   status = rsmi_num_monitor_devices(&n_devices);
 
   std::vector<std::string> times(n_samples);
-  std::vector<std::vector<int>> rsmi_power_measurements(n_samples, std::vector<int>(n_gpus, 0));
+  std::vector<bool> get_rsmi_average_power(n_samples, false);
+  std::vector<bool> get_rsmi_socket_power(n_samples, false);
+  std::vector<std::vector<int>> rsmi_average_power_measurements(n_samples, std::vector<int>(n_gpus, 0));
+  std::vector<std::vector<int>> rsmi_socket_power_measurements(n_samples, std::vector<int>(n_gpus, 0));
   std::vector<std::vector<int>> cray_power_measurements(n_samples, std::vector<int>(n_gpus, 0));
 
-  uint64_t power, socket_power;
+
   RSMI_POWER_TYPE power_type;
   int i_power_type;
 
+  uint64_t power, rsmi_power_avrg, rsmi_power_socket;
   for (int dev_indx=0; dev_indx < n_gpus; dev_indx++) {
     std::cout << "dev_indx: " << dev_indx << std::endl;
     status_p = rsmi_dev_power_get( 2*dev_indx, &power, &power_type);
@@ -107,8 +113,19 @@ int main(int argc, char* argv[]) {
     else if ( status_p == RSMI_STATUS_NOT_SUPPORTED ) std::cout << "rocm-smi: power_get not supported" << std::endl;
     else if ( status_p == RSMI_STATUS_INVALID_ARGS ) std::cout << "rocm-smi: power_get invalid arguments" << std::endl;
 
-    status_ps = rsmi_dev_current_socket_power_get( 2*dev_indx, &socket_power );
-    if ( status_ps == RSMI_STATUS_SUCCESS ) std::cout << "rocm-smi: current_socket_power_get success" << std::endl;
+    status_ps = rsmi_dev_power_ave_get (2*dev_indx, 0, &rsmi_power_avrg);
+    if ( status_ps == RSMI_STATUS_SUCCESS ){
+      std::cout << "rocm-smi: power_ave_get success" << std::endl;
+      get_rsmi_average_power[dev_indx] = true;
+    } 
+    else if ( status_ps == RSMI_STATUS_NOT_SUPPORTED ) std::cout << "rocm-smi: power_ave_get not supported" << std::endl;
+    else if ( status_ps == RSMI_STATUS_INVALID_ARGS ) std::cout << "rocm-smi: power_ave_get invalid arguments" << std::endl;
+
+    status_ps = rsmi_dev_current_socket_power_get( 2*dev_indx, &rsmi_power_socket );
+    if ( status_ps == RSMI_STATUS_SUCCESS ){
+      std::cout << "rocm-smi: current_socket_power_get success" << std::endl;
+      get_rsmi_socket_power[dev_indx] = true;
+    } 
     else if ( status_ps == RSMI_STATUS_NOT_SUPPORTED ) std::cout << "rocm-smi: current_socket_power_get not supported" << std::endl;
     else if ( status_ps == RSMI_STATUS_INVALID_ARGS ) std::cout << "rocm-smi: current_socket_power_get invalid arguments" << std::endl;
 
@@ -127,13 +144,23 @@ int main(int argc, char* argv[]) {
     times[sample_indx] = getCurrentTimestamp();
     for (int dev_indx=0; dev_indx < n_gpus; dev_indx++) {
       dev_id = devices[dev_indx];
-      status_p = rsmi_dev_power_ave_get (2*dev_id, 0, &power);
-      rsmi_power_measurements[sample_indx][dev_indx] = static_cast<int>(power/1e6);
       
-      get_cray_power( dev_id, cray_power, cray_timestamp );
-      cray_power_measurements[sample_indx][dev_indx] = cray_power;
-    }
+      if (get_rsmi_average_power[dev_indx]){
+        status_p = rsmi_dev_power_ave_get (2*dev_id, 0, &rsmi_power_avrg);
+        rsmi_average_power_measurements[sample_indx][dev_indx] = static_cast<int>(rsmi_power_avrg);
+      }
 
+      if (get_rsmi_socket_power[dev_indx]){
+        status_p = rsmi_dev_current_socket_power_get(2*dev_id, &rsmi_power_socket);
+        rsmi_socket_power_measurements[sample_indx][dev_indx] = static_cast<int>(rsmi_power_socket/1e6);
+      }
+      
+      if (get_cray_counters){
+        get_cray_power( dev_id, cray_power, cray_timestamp );
+        cray_power_measurements[sample_indx][dev_indx] = cray_power;
+      }
+    }
+    
     // std::cout << "\nTime: " << times[iter] << " Power [W]: ";
     // for (int dev_indx=0; dev_indx<n_gpus; dev_indx++ ) std::cout << " " << rsmi_power_measurements[iter][dev_indx];
     // std::cout << std::endl;
@@ -144,12 +171,23 @@ int main(int argc, char* argv[]) {
   std::cout << "Finished power profiling at " << getCurrentTimestamp() << std::endl;
   
   std::cout << "Writing measurements to output file." << std::endl;
-  for ( int sample_indx=0; sample_indx < n_samples; sample_indx++ ){
 
+  std::stringstream header;
+  header << "date time ";
+  for ( int dev_indx=0; dev_indx<n_gpus; dev_indx++ ){
+   if (get_rsmi_average_power[dev_indx]) header << " dev" + std::to_string(dev_indx) + "-rsmi_average";
+   if (get_rsmi_socket_power[dev_indx])  header << " dev" + std::to_string(dev_indx) + "-rsmi_socket";
+   if (get_cray_counters) header << " dev" + std::to_string(dev_indx) + "-rsmi_socket"; 
+  }
+  header << std::endl;
+  out_file << header.str();
+
+  for ( int sample_indx=0; sample_indx < n_samples; sample_indx++ ){
     out_file << times[sample_indx] << " ";
     for ( int dev_indx=0; dev_indx<n_gpus; dev_indx++ ){
-      out_file << rsmi_power_measurements[sample_indx][dev_indx] << " ";
-      out_file << cray_power_measurements[sample_indx][dev_indx] << " ";
+      if (get_rsmi_average_power[dev_indx]) out_file << rsmi_average_power_measurements[sample_indx][dev_indx] << " ";
+      if (get_rsmi_socket_power[dev_indx])  out_file << rsmi_socket_power_measurements[sample_indx][dev_indx] << " ";
+      if (get_cray_counters) out_file << cray_power_measurements[sample_indx][dev_indx] << " ";
     }
     out_file << std::endl;
 
